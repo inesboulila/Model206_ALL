@@ -9,7 +9,7 @@ import numpy as np
 import pickle
 import re
 
-st.set_page_config(page_title="miRNA Predictor (ALL)", page_icon="🧬", layout="wide")
+st.set_page_config(page_title="miRNA Predictor", page_icon="🧬", layout="wide")
 
 # ── Load model bundle ─────────────────────────────────────────
 @st.cache_resource
@@ -29,8 +29,35 @@ except FileNotFoundError:
     st.stop()
 
 
+# ── Conservation label map ────────────────────────────────────
+CONS_LABELS = {
+    2:  "Broadly conserved",
+    1:  "Mammal conserved",
+    0:  "Poorly conserved",
+    -1: "Species-specific",
+}
+
+def conservation_label(val) -> str:
+    """Convert conservation value to human-readable label."""
+    try:
+        return CONS_LABELS.get(int(float(val)), "Unknown")
+    except (TypeError, ValueError):
+        return "Unknown"
+
+def conservation_numeric(val) -> float:
+    """
+    Convert conservation value to float for the model.
+    Returns NaN if the value is missing or cannot be converted.
+    NaN tells LightGBM to rely on other features for this row.
+    """
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return np.nan
+
+
 def normalize_mirna(name: str) -> str:
-    """Strip species prefix (hsa-, mmu-) and arm suffix (-5p, -3p) for fuzzy matching."""
+    """Strip species prefix and arm suffix for fuzzy matching."""
     name = name.strip().lower()
     name = re.sub(r'^[a-z]{3}-', '', name)
     name = re.sub(r'[-.](5p|3p)$', '', name)
@@ -38,39 +65,38 @@ def normalize_mirna(name: str) -> str:
 
 def resolve_input(user_input: str):
     """
-    Accepts either:
-      - Full miRNA name:  hsa-miR-155-5p
-      - Short miRNA name: miR-155-5p  (no species prefix)
-      - Accession number: MIMAT0000646
-    Returns (seed_family, family_conservation) or (None, None) if not found.
+    Accepts miRNA name (with or without prefix) or accession number.
+    Returns dict with keys: seed_family, family_conservation (numeric float or NaN)
     """
     s = user_input.strip()
 
-    # 1. Try exact miRNA name match
+    # 1. Exact miRNA name match
     if s in mirna_lookup:
         info = mirna_lookup[s]
-        return info['seed_family'], info.get('family_conservation')
+        return info
 
-    # 2. Try accession number match
+    # 2. Accession number match
     if s in accession_lookup:
         info = accession_lookup[s]
-        return info['seed_family'], info.get('family_conservation')
+        return info
 
-    # 3. Try fuzzy: normalize input and compare against normalized miRNA names
+    # 3. Fuzzy: normalize input and compare against all miRNA names
     norm_input = normalize_mirna(s)
     for mirna_name, info in mirna_lookup.items():
         if normalize_mirna(mirna_name) == norm_input:
-            return info['seed_family'], info.get('family_conservation')
+            return info
 
-    return None, None
+    return None
 
 
 # ══════════════════════════════════════════════════════════════
 # HEADER
 # ══════════════════════════════════════════════════════════════
 st.title("🧬 miRNA Upregulation Predictor")
-st.markdown("Predicts whether a miRNA is **upregulated** or **downregulated** during *Leishmania* infection.")
-st.caption("Model: LightGBM · all conservation levels · family_conservation feature included")
+st.markdown(
+    "Predicts whether a miRNA is **upregulated** or **downregulated** "
+    "during *Leishmania* infection."
+)
 st.divider()
 
 col_input, col_result = st.columns([1, 1], gap="large")
@@ -81,7 +107,7 @@ with col_input:
 
     mirna_input = st.text_input(
         "miRNA name or accession number",
-        placeholder="e.g. hsa-miR-155-5p  or  miR-155-5p  or  MIMAT0000646"
+        placeholder="e.g. hsa-miR-155-5p  ·  miR-155-5p  ·  MIMAT0000646"
     )
 
     parasite  = st.selectbox("Parasite species", options=options['parasite'])
@@ -103,34 +129,63 @@ with col_result:
         if not mirna_input.strip():
             st.info("Please enter a miRNA name or accession number.")
         else:
-            # Resolve input → seed_family + family_conservation
-            seed_family, family_conservation = resolve_input(mirna_input.strip())
+            info = resolve_input(mirna_input.strip())
 
-            if seed_family and seed_family not in ('not_broadly_conserved', 'not_found'):
-                is_conserved = 1
-                cons_label = {2: "broadly conserved", 1: "mammal conserved",
-                              0: "poorly conserved", -1: "species-specific"}.get(
-                              int(family_conservation) if family_conservation is not None else -99, "unknown")
-                st.info(f"Found · seed family: **{seed_family}** · conservation: **{cons_label}**")
+            if info is not None:
+                raw_family = info.get('seed_family')
+                raw_cons   = info.get('family_conservation')
+
+                # Determine if seed family is meaningful
+                if raw_family and raw_family not in ('not_broadly_conserved', 'not_found'):
+                    seed_family  = raw_family
+                    is_conserved = 1
+                else:
+                    seed_family  = np.nan
+                    is_conserved = 0
+                    raw_cons     = None
+
+                # Convert conservation to float for model, label for display
+                family_conservation_num   = conservation_numeric(raw_cons)
+                family_conservation_label = conservation_label(raw_cons)
+
+                # Display miRNA info card
+                st.info(
+                    f"**Seed family:** {seed_family if seed_family is not np.nan else 'Unknown'}  \n"
+                    f"**Conservation:** {family_conservation_label}"
+                )
+
             else:
-                # Not found — model relies on parasite, organism, cell type, time
-                seed_family          = np.nan
-                is_conserved         = 0
-                family_conservation  = np.nan
-                st.info(f"**{mirna_input.strip()}** not found. Prediction relies on parasite, organism, cell type, and time.")
+                # miRNA not found in lookup at all
+                seed_family               = np.nan
+                is_conserved              = 0
+                family_conservation_num   = np.nan
+                family_conservation_label = "Unknown"
 
-            # Build input row — pass parasite/cell type exactly as in training (no lowercasing)
+                st.info(
+                    f"**{mirna_input.strip()}** not found in the database.  \n"
+                    f"**Seed family:** Unknown  \n"
+                    f"**Conservation:** Unknown  \n"
+                    "Prediction relies on parasite, organism, cell type, and time."
+                )
+
+            # Build input row — family_conservation passed as float (NaN if unknown)
             parasite_celltype = f"{parasite}_{cell_type}"
+
             input_df = pd.DataFrame([{
                 'parasite':            parasite,
                 'organism':            organism,
                 'cell type':           cell_type,
                 'seed_family':         seed_family,
                 'parasite_celltype':   parasite_celltype,
-                'time':                time,
-                'is_conserved':        is_conserved,
-                'family_conservation': family_conservation,
+                'time':                float(time),
+                'is_conserved':        float(is_conserved),
+                'family_conservation': family_conservation_num,   # always float or NaN
             }])
+
+            # Enforce correct dtypes — prevents the object dtype error
+            input_df['time']                = pd.to_numeric(input_df['time'],                errors='coerce')
+            input_df['is_conserved']        = pd.to_numeric(input_df['is_conserved'],        errors='coerce')
+            input_df['family_conservation'] = pd.to_numeric(input_df['family_conservation'], errors='coerce')
 
             try:
                 proba     = model.predict_proba(input_df)[0]
@@ -139,6 +194,7 @@ with col_result:
                 prob_down = proba[0]
 
                 st.divider()
+
                 if pred == 1:
                     st.success("## ⬆ Upregulated")
                 else:
@@ -147,26 +203,39 @@ with col_result:
                 st.markdown(f"**Confidence:** {max(prob_up, prob_down)*100:.1f}%")
 
                 c1, c2 = st.columns(2)
-                c1.metric("Upregulated",   f"{prob_up   * 100:.1f}%")
-                c2.metric("Downregulated", f"{prob_down * 100:.1f}%")
+                c1.metric("P(Upregulated)",   f"{prob_up   * 100:.1f}%")
+                c2.metric("P(Downregulated)", f"{prob_down * 100:.1f}%")
 
-                st.progress(float(prob_up), text=f"↑ {prob_up*100:.1f}%  |  ↓ {prob_down*100:.1f}%")
+                st.progress(
+                    float(prob_up),
+                    text=f"↑ {prob_up*100:.1f}%  |  ↓ {prob_down*100:.1f}%"
+                )
 
                 with st.expander("Input summary"):
-                    st.dataframe(input_df, use_container_width=True, hide_index=True)
+                    display_df = input_df.copy()
+                    display_df['family_conservation'] = family_conservation_label
+                    display_df['is_conserved'] = 'Yes' if is_conserved else 'No'
+                    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
             except Exception as e:
                 st.error(f"Prediction error: {e}")
+
     else:
-        st.markdown("<div style='color:gray;margin-top:2rem'>Fill in the conditions and click <b>Predict</b>.</div>",
-                    unsafe_allow_html=True)
+        st.markdown(
+            "<div style='color:gray;margin-top:2rem'>"
+            "Fill in the conditions and click <b>Predict</b>."
+            "</div>",
+            unsafe_allow_html=True
+        )
 
 # ══════════════════════════════════════════════════════════════
-# METRICS
+# MODEL METRICS
 # ══════════════════════════════════════════════════════════════
 st.divider()
 st.subheader("Model performance")
-st.caption(f"LightGBM · Optuna-tuned · {metrics['n_train']} training samples · 5-fold CV")
+st.caption(
+    f"LightGBM · Optuna-tuned · {metrics['n_train']} training samples · 5-fold CV"
+)
 
 m1, m2, m3 = st.columns(3)
 m1.metric("ROC-AUC",  f"{metrics['auc_mean']:.3f}", f"± {metrics['auc_std']:.3f}")
@@ -183,8 +252,10 @@ fi = pd.DataFrame(metrics['feature_importance'])
 fi['importance'] = fi['importance'].round(4)
 fi['std']        = fi['std'].round(4)
 fi.columns       = ['Feature', 'Importance (AUC drop)', 'Std']
-st.dataframe(fi.style.background_gradient(subset=['Importance (AUC drop)'], cmap='Greens'),
-             use_container_width=True, hide_index=True)
+st.dataframe(
+    fi.style.background_gradient(subset=['Importance (AUC drop)'], cmap='Greens'),
+    use_container_width=True, hide_index=True
+)
 
 with st.expander("Best hyperparameters"):
     st.json(metrics['best_params'])
